@@ -18,6 +18,8 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import re
+
 from tools import search_listings, suggest_outfit, create_fit_card
 
 
@@ -43,6 +45,43 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "fit_card": None,            # string returned by create_fit_card
         "error": None,               # set if the interaction ended early
     }
+
+
+# ── query parser ─────────────────────────────────────────────────────────────
+
+def _parse_query(query: str) -> dict:
+    """
+    Extract description, size, and max_price from a natural language query
+    using regex. Returns a dict with keys: description, size, max_price.
+    """
+    # Max price: "under $30", "under 30", or bare "$30"
+    price_match = re.search(r'under\s+\$?(\d+(?:\.\d+)?)', query, re.IGNORECASE)
+    if not price_match:
+        price_match = re.search(r'\$(\d+(?:\.\d+)?)', query, re.IGNORECASE)
+    max_price = float(price_match.group(1)) if price_match else None
+
+    # Size: "size M", "size XL", "size W30 L30", "size S/M"
+    # Second word restricted to measurement tokens (e.g. L30) to avoid
+    # greedily capturing the next regular word (e.g. "under")
+    size_match = re.search(
+        r'\bsize\s+([A-Za-z0-9/]+(?:\s+[A-Z]\d+)?)', query, re.IGNORECASE
+    )
+    size = size_match.group(1).strip() if size_match else None
+
+    # Description: remove price and size phrases, then strip filler words
+    desc = query
+    desc = re.sub(r'\bunder\s+\$?\d+(?:\.\d+)?', '', desc, flags=re.IGNORECASE)
+    desc = re.sub(r'\$\d+(?:\.\d+)?', '', desc, flags=re.IGNORECASE)
+    desc = re.sub(
+        r'\bsize\s+[A-Za-z0-9/]+(?:\s+[A-Za-z0-9]+)?', '', desc, flags=re.IGNORECASE
+    )
+    desc = re.sub(
+        r"\b(i'm|i am|looking for|a|an|in|for|want|need|find|me)\b",
+        ' ', desc, flags=re.IGNORECASE,
+    )
+    desc = ' '.join(desc.split()) or query  # fallback to full query if stripped empty
+
+    return {"description": desc, "size": size, "max_price": max_price}
 
 
 # ── planning loop ─────────────────────────────────────────────────────────────
@@ -92,32 +131,72 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse query into description, size, max_price
+    parsed = _parse_query(query)
+    session["parsed"] = parsed
+
+    # Step 3: Search listings — stop early if nothing found
+    results = search_listings(
+        description=parsed["description"],
+        size=parsed["size"],
+        max_price=parsed["max_price"],
+    )
+    session["search_results"] = results
+
+    if not results:
+        size_str = f" in size {parsed['size']}" if parsed["size"] else ""
+        price_str = f" under ${parsed['max_price']:.0f}" if parsed["max_price"] else ""
+        session["error"] = (
+            f"No listings matched \"{parsed['description']}\"{size_str}{price_str}. "
+            "Try broader keywords, omit the size filter, or raise your budget."
+        )
+        return session  # do NOT proceed to suggest_outfit
+
+    # Step 4: Select top result
+    session["selected_item"] = results[0]
+
+    # Step 5: Suggest outfit (continue even if it falls back to generic advice)
+    try:
+        outfit = suggest_outfit(session["selected_item"], wardrobe)
+        session["outfit_suggestion"] = outfit.strip() or "No specific outfit could be suggested."
+    except Exception:
+        session["outfit_suggestion"] = "No specific outfit could be suggested."
+
+    # Step 6: Create fit card (skip rather than crash if outfit is unusable)
+    try:
+        fit_card = create_fit_card(session["outfit_suggestion"], session["selected_item"])
+        session["fit_card"] = fit_card.strip() or None
+    except Exception:
+        session["fit_card"] = None
+
+    # Step 7: Return completed session
     return session
 
 
 # ── CLI test ──────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    from utils.data_loader import get_example_wardrobe, get_empty_wardrobe
+    from utils.data_loader import get_example_wardrobe
 
     print("=== Happy path: graphic tee ===\n")
-    session = run_agent(
+    result = run_agent(
         query="looking for a vintage graphic tee under $30",
         wardrobe=get_example_wardrobe(),
     )
-    if session["error"]:
-        print(f"Error: {session['error']}")
+    if result["error"]:
+        print(f"Error: {result['error']}")
     else:
-        print(f"Found: {session['selected_item']['title']}")
-        print(f"\nOutfit: {session['outfit_suggestion']}")
-        print(f"\nFit card: {session['fit_card']}")
+        item = result["selected_item"]
+        print(f"Found: {item['title']}")
+        print(f"\nOutfit: {result['outfit_suggestion']}")
+        print(f"\nFit card: {result['fit_card']}")
 
     print("\n\n=== No-results path ===\n")
-    session2 = run_agent(
+    result2 = run_agent(
         query="designer ballgown size XXS under $5",
         wardrobe=get_example_wardrobe(),
     )
-    print(f"Error message: {session2['error']}")
+    print(f"Error message: {result2['error']}")
